@@ -1,0 +1,417 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Serverless Ticket System API - API Gateway, Lambda, and DynamoDB backend
+  with TicketSystem-Tickets and TicketSystem-Users tables.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+
+Resources:
+  # ============================================================
+  # DynamoDB Tables
+  # ============================================================
+  TicketsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: TicketSystem-Tickets
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ticketId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: severity
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ticketId
+          KeyType: HASH
+        - AttributeName: userId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: userId-index
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: severity-index
+          KeySchema:
+            - AttributeName: severity
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: TicketSystem-Users
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================
+  # IAM Role for Lambda
+  # ============================================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub TicketSystem-LambdaRole-${Environment}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt TicketsTable.Arn
+                  - !Sub ${TicketsTable.Arn}/index/*
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt UsersTable.Arn
+
+  # ============================================================
+  # Lambda Function
+  # ============================================================
+  TicketSystemFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub TicketSystem-Handler-${Environment}
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          TICKETS_TABLE: !Ref TicketsTable
+          USERS_TABLE: !Ref UsersTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          from datetime import datetime
+
+          dynamodb = boto3.resource('dynamodb')
+          tickets_table = dynamodb.Table(os.environ['TICKETS_TABLE'])
+          users_table = dynamodb.Table(os.environ['USERS_TABLE'])
+
+          VALID_SEVERITIES = ['High', 'Medium', 'Low']
+
+          def lambda_handler(event, context):
+              http_method = event['httpMethod']
+              resource = event.get('resource', '')
+              path = event.get('path', '')
+              query_params = event.get('queryStringParameters') or {}
+
+              try:
+                  # POST /tickets - Create a new ticket
+                  if http_method == 'POST' and '/tickets' in path:
+                      return create_ticket(event)
+
+                  # GET /tickets - Retrieve all tickets or filter by userId/severity
+                  elif http_method == 'GET' and '/tickets' in path:
+                      return get_tickets(query_params)
+
+                  else:
+                      return build_response(404, {'message': 'Resource not found'})
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return build_response(500, {'message': 'Internal server error', 'error': str(e)})
+
+
+          def create_ticket(event):
+              """Create a new ticket with userId, issue, description, and severity."""
+              body = json.loads(event.get('body', '{}'))
+
+              # Validate required fields
+              required_fields = ['userId', 'issue', 'description', 'severity']
+              missing_fields = [f for f in required_fields if f not in body or not body[f]]
+              if missing_fields:
+                  return build_response(400, {
+                      'message': f'Missing required fields: {", ".join(missing_fields)}'
+                  })
+
+              # Validate severity
+              severity = body['severity']
+              if severity not in VALID_SEVERITIES:
+                  return build_response(400, {
+                      'message': f'Invalid severity. Must be one of: {", ".join(VALID_SEVERITIES)}'
+                  })
+
+              # Generate ticket ID and timestamp
+              ticket_id = str(uuid.uuid4())
+              timestamp = datetime.utcnow().isoformat() + 'Z'
+
+              # Create ticket item
+              ticket_item = {
+                  'ticketId': ticket_id,
+                  'userId': body['userId'],
+                  'issue': body['issue'],
+                  'description': body['description'],
+                  'severity': severity,
+                  'status': 'Open',
+                  'createdAt': timestamp,
+                  'updatedAt': timestamp
+              }
+
+              # Put item in DynamoDB
+              tickets_table.put_item(Item=ticket_item)
+
+              # Upsert user in Users table (won't fail on existing users)
+              users_table.update_item(
+                  Key={'userId': body['userId']},
+                  UpdateExpression='SET lastActivity = :ts',
+                  ExpressionAttributeValues={':ts': timestamp}
+              )
+
+              return build_response(201, {
+                  'message': 'Ticket created successfully',
+                  'ticket': ticket_item
+              })
+
+
+          def get_tickets(query_params):
+              """Retrieve tickets - all, by userId, or by severity."""
+              user_id = query_params.get('userId')
+              severity = query_params.get('severity')
+
+              # Filter by userId using GSI
+              if user_id:
+                  response = tickets_table.query(
+                      IndexName='userId-index',
+                      KeyConditionExpression=boto3.dynamodb.conditions.Key('userId').eq(user_id)
+                  )
+                  tickets = response.get('Items', [])
+
+                  # Further filter by severity if both params provided
+                  if severity:
+                      if severity not in VALID_SEVERITIES:
+                          return build_response(400, {
+                              'message': f'Invalid severity. Must be one of: {", ".join(VALID_SEVERITIES)}'
+                          })
+                      tickets = [t for t in tickets if t.get('severity') == severity]
+
+                  return build_response(200, {
+                      'count': len(tickets),
+                      'tickets': tickets
+                  })
+
+              # Filter by severity only using GSI
+              elif severity:
+                  if severity not in VALID_SEVERITIES:
+                      return build_response(400, {
+                          'message': f'Invalid severity. Must be one of: {", ".join(VALID_SEVERITIES)}'
+                      })
+                  response = tickets_table.query(
+                      IndexName='severity-index',
+                      KeyConditionExpression=boto3.dynamodb.conditions.Key('severity').eq(severity)
+                  )
+                  tickets = response.get('Items', [])
+                  return build_response(200, {
+                      'count': len(tickets),
+                      'tickets': tickets
+                  })
+
+              # Return all tickets (scan)
+              else:
+                  response = tickets_table.scan()
+                  tickets = response.get('Items', [])
+
+                  # Handle pagination for large datasets
+                  while 'LastEvaluatedKey' in response:
+                      response = tickets_table.scan(
+                          ExclusiveStartKey=response['LastEvaluatedKey']
+                      )
+                      tickets.extend(response.get('Items', []))
+
+                  return build_response(200, {
+                      'count': len(tickets),
+                      'tickets': tickets
+                  })
+
+
+          def build_response(status_code, body):
+              """Build a standardized API Gateway response."""
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                      'Access-Control-Allow-Headers': 'Content-Type,Authorization'
+                  },
+                  'body': json.dumps(body, default=str)
+              }
+
+  # ============================================================
+  # API Gateway - REST API
+  # ============================================================
+  TicketSystemApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub TicketSystem-API-${Environment}
+      Description: REST API for the Ticket System
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # /tickets resource
+  TicketsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TicketSystemApi
+      ParentId: !GetAtt TicketSystemApi.RootResourceId
+      PathPart: tickets
+
+  # POST /tickets
+  PostTicketsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TicketSystemApi
+      ResourceId: !Ref TicketsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations
+          - FunctionArn: !GetAtt TicketSystemFunction.Arn
+
+  # GET /tickets
+  GetTicketsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TicketSystemApi
+      ResourceId: !Ref TicketsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.querystring.userId: false
+        method.request.querystring.severity: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations
+          - FunctionArn: !GetAtt TicketSystemFunction.Arn
+
+  # OPTIONS /tickets (CORS)
+  OptionsTicketsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TicketSystemApi
+      ResourceId: !Ref TicketsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # API Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - PostTicketsMethod
+      - GetTicketsMethod
+      - OptionsTicketsMethod
+    Properties:
+      RestApiId: !Ref TicketSystemApi
+
+  # API Stage
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref TicketSystemApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref Environment
+      Description: !Sub ${Environment} stage
+
+  # Lambda Permission for API Gateway
+  LambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt TicketSystemFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TicketSystemApi}/*
+
+# ============================================================
+# Outputs
+# ============================================================
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${TicketSystemApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+
+  PostTicketEndpoint:
+    Description: POST endpoint to create a new ticket
+    Value: !Sub https://${TicketSystemApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/tickets
+
+  GetTicketsEndpoint:
+    Description: GET endpoint to retrieve tickets (supports ?userId= and ?severity= query params)
+    Value: !Sub https://${TicketSystemApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/tickets
+
+  TicketsTableName:
+    Description: DynamoDB Tickets table name
+    Value: !Ref TicketsTable
+
+  UsersTableName:
+    Description: DynamoDB Users table name
+    Value: !Ref UsersTable
+
+  LambdaFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt TicketSystemFunction.Arn

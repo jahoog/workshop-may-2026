@@ -28,3 +28,15 @@
 - Create CodeCommit Repo
 - Push to repo
 - Create Amplify App
+
+6. API Gateway - Deploy REST API
+
+- Use [CFT Base Code Template](./code/ticketSystem-base.yml)
+
+7. Amplify Hosting - Update App
+
+8. API Gateway - Deploy Full API with Authentication
+
+- Use [CFT Final Template](./code/ticketSystem-rest-final.yml)
+
+9. Amplify Hosting - Deploy Final App

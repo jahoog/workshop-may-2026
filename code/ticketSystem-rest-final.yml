@@ -1,0 +1,1045 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Serverless Ticket System API - API Gateway, Lambda, DynamoDB, and Cognito.
+  Supports public ticket submission, authenticated user tracking,
+  and Admin-only update/delete operations. Full CORS support.
+  Enhanced CloudWatch logging with line numbers and payload tracing.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+  AllowedOrigin:
+    Type: String
+    Default: "*"
+    Description: >
+      Allowed CORS origin. IMPORTANT: Set to your specific domain in production
+      (e.g., https://yourapp.amplifyapp.com). Using '*' disables credentials support.
+  DeploymentVersion:
+    Type: String
+    Default: "1"
+    Description: Increment to force API Gateway redeployment
+
+Resources:
+  # ============================================================
+  # Cognito User Pool & Client
+  # ============================================================
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub TicketSystem-UserPool-${Environment}
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: name
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub TicketSystem-Client-${Environment}
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      SupportedIdentityProviders:
+        - COGNITO
+      AllowedOAuthFlows:
+        - implicit
+        - code
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+      AllowedOAuthFlowsUserPoolClient: true
+      CallbackURLs:
+        - http://localhost:3000
+      LogoutURLs:
+        - http://localhost:3000
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub ticketsystem-${Environment}-${AWS::AccountId}
+      UserPoolId: !Ref UserPool
+
+  # Admin Group
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Admin
+      UserPoolId: !Ref UserPool
+      Description: Administrators who can update and delete any ticket
+
+  # ============================================================
+  # DynamoDB Tables
+  # ============================================================
+  TicketsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: TicketSystem-Tickets
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ticketId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: severity
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ticketId
+          KeyType: HASH
+        - AttributeName: userId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: userId-index
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: severity-index
+          KeySchema:
+            - AttributeName: severity
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: TicketSystem-Users
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================
+  # IAM Role for Lambda
+  # ============================================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub TicketSystem-LambdaRole-${Environment}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt TicketsTable.Arn
+                  - !Sub ${TicketsTable.Arn}/index/*
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt UsersTable.Arn
+
+  # ============================================================
+  # Lambda Function
+  # ============================================================
+  TicketSystemFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub TicketSystem-Handler-${Environment}
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          TICKETS_TABLE: !Ref TicketsTable
+          USERS_TABLE: !Ref UsersTable
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import os
+          import traceback
+          from datetime import datetime
+          from boto3.dynamodb.conditions import Key, Attr
+
+          dynamodb = boto3.resource('dynamodb')
+          tickets_table = dynamodb.Table(os.environ['TICKETS_TABLE'])
+          users_table = dynamodb.Table(os.environ['USERS_TABLE'])
+          ALLOWED_ORIGIN = os.environ.get('ALLOWED_ORIGIN', '*')
+
+          VALID_SEVERITIES = ['High', 'Medium', 'Low']
+          VALID_STATUSES = ['Open', 'In Progress', 'Resolved', 'Closed']
+
+
+          def get_cors_headers():
+              """Build CORS headers dynamically based on origin configuration."""
+              headers = {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
+                  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Amz-Date, X-Api-Key, X-Amz-Security-Token',
+                  'Access-Control-Max-Age': '86400'
+              }
+              if ALLOWED_ORIGIN != '*':
+                  headers['Access-Control-Allow-Credentials'] = 'true'
+              return headers
+
+
+          def lambda_handler(event, context):
+              http_method = event['httpMethod']
+              path = event.get('path', '')
+              query_params = event.get('queryStringParameters') or {}
+              path_params = event.get('pathParameters') or {}
+
+              # ===== ENHANCED LOGGING: Log full event payload =====
+              print("=" * 60)
+              print(f"[REQUEST] Method: {http_method} | Path: {path}")
+              print(f"[REQUEST] Path Params: {json.dumps(path_params)}")
+              print(f"[REQUEST] Query Params: {json.dumps(query_params)}")
+              print(f"[REQUEST] Body: {event.get('body', 'None')}")
+              print(f"[REQUEST] Full Event: {json.dumps(event, default=str)}")
+              print("=" * 60)
+
+              # Handle OPTIONS preflight requests directly
+              if http_method == 'OPTIONS':
+                  return build_response(200, {'message': 'CORS preflight OK'})
+
+              # Extract authenticated user info from Cognito authorizer
+              auth_context = get_auth_context(event)
+              print(f"[AUTH] Context: {json.dumps(auth_context)}")
+
+              try:
+                  # Routes with {ticketId} path parameter
+                  if path_params.get('ticketId'):
+                      ticket_id = path_params['ticketId']
+                      print(f"[ROUTE] Matched /ticketId route | ticketId: {ticket_id}")
+
+                      # GET /tickets/{ticketId}
+                      if http_method == 'GET':
+                          return get_ticket_by_id(ticket_id)
+
+                      # PUT /tickets/{ticketId}
+                      elif http_method == 'PUT':
+                          return update_ticket(event, ticket_id, auth_context)
+
+                      # DELETE /tickets/{ticketId}
+                      elif http_method == 'DELETE':
+                          return delete_ticket(event, ticket_id, auth_context)
+
+                  # Routes on /tickets collection
+                  else:
+                      # POST /tickets
+                      if http_method == 'POST':
+                          return create_ticket(event, auth_context)
+
+                      # GET /tickets
+                      elif http_method == 'GET':
+                          return get_tickets(query_params)
+
+                  return build_response(404, {'message': 'Resource not found'})
+
+              except Exception as e:
+                  error_traceback = traceback.format_exc()
+                  print(f"[ERROR] Exception: {str(e)}")
+                  print(f"[ERROR] Type: {type(e).__name__}")
+                  print(f"[ERROR] Traceback: {error_traceback}")
+                  return build_response(500, {
+                      'message': 'Internal server error',
+                      'error': str(e),
+                      'errorType': type(e).__name__
+                  })
+
+
+          def get_auth_context(event):
+              """Extract authentication context from the Cognito authorizer."""
+              context = {
+                  'is_authenticated': False,
+                  'is_admin': False,
+                  'user_id': None,
+                  'email': None,
+                  'groups': []
+              }
+
+              request_context = event.get('requestContext', {})
+              authorizer = request_context.get('authorizer', {})
+              claims = authorizer.get('claims', {})
+
+              if claims:
+                  context['is_authenticated'] = True
+                  context['user_id'] = claims.get('sub')
+                  context['email'] = claims.get('email')
+
+                  groups_str = claims.get('cognito:groups', '')
+                  if groups_str:
+                      context['groups'] = groups_str.split(',') if isinstance(groups_str, str) else groups_str
+                  context['is_admin'] = 'Admin' in context['groups']
+
+              return context
+
+
+          def create_ticket(event, auth_context):
+              """Create a new ticket. Anyone can submit; authenticated users get their ID stored."""
+              body = json.loads(event.get('body', '{}'))
+              print(f"[CREATE_TICKET] Parsed body: {json.dumps(body)}")
+
+              required_fields = ['userId', 'issue', 'description', 'severity']
+              missing_fields = [f for f in required_fields if f not in body or not body[f]]
+              if missing_fields:
+                  return build_response(400, {
+                      'message': f'Missing required fields: {", ".join(missing_fields)}'
+                  })
+
+              severity = body['severity']
+              if severity not in VALID_SEVERITIES:
+                  return build_response(400, {
+                      'message': f'Invalid severity. Must be one of: {", ".join(VALID_SEVERITIES)}'
+                  })
+
+              ticket_id = str(uuid.uuid4())
+              timestamp = datetime.utcnow().isoformat() + 'Z'
+
+              ticket_item = {
+                  'ticketId': ticket_id,
+                  'userId': body['userId'],
+                  'issue': body['issue'],
+                  'description': body['description'],
+                  'severity': severity,
+                  'status': 'Open',
+                  'createdAt': timestamp,
+                  'updatedAt': timestamp
+              }
+
+              if auth_context['is_authenticated']:
+                  ticket_item['authenticatedId'] = auth_context['user_id']
+                  ticket_item['authenticatedEmail'] = auth_context['email']
+
+              print(f"[CREATE_TICKET] Writing item: {json.dumps(ticket_item)}")
+              tickets_table.put_item(Item=ticket_item)
+
+              users_table.update_item(
+                  Key={'userId': body['userId']},
+                  UpdateExpression='SET lastActivity = :ts',
+                  ExpressionAttributeValues={':ts': timestamp}
+              )
+
+              return build_response(201, {
+                  'message': 'Ticket created successfully',
+                  'ticket': ticket_item
+              })
+
+
+          def get_tickets(query_params):
+              """Retrieve tickets - all, by userId, or by severity."""
+              user_id = query_params.get('userId')
+              severity = query_params.get('severity')
+              print(f"[GET_TICKETS] userId: {user_id} | severity: {severity}")
+
+              if user_id:
+                  response = tickets_table.query(
+                      IndexName='userId-index',
+                      KeyConditionExpression=Key('userId').eq(user_id)
+                  )
+                  tickets = response.get('Items', [])
+
+                  while 'LastEvaluatedKey' in response:
+                      response = tickets_table.query(
+                          IndexName='userId-index',
+                          KeyConditionExpression=Key('userId').eq(user_id),
+                          ExclusiveStartKey=response['LastEvaluatedKey']
+                      )
+                      tickets.extend(response.get('Items', []))
+
+                  if severity:
+                      if severity not in VALID_SEVERITIES:
+                          return build_response(400, {
+                              'message': f'Invalid severity. Must be one of: {", ".join(VALID_SEVERITIES)}'
+                          })
+                      tickets = [t for t in tickets if t.get('severity') == severity]
+
+                  return build_response(200, {'count': len(tickets), 'tickets': tickets})
+
+              elif severity:
+                  if severity not in VALID_SEVERITIES:
+                      return build_response(400, {
+                          'message': f'Invalid severity. Must be one of: {", ".join(VALID_SEVERITIES)}'
+                      })
+                  response = tickets_table.query(
+                      IndexName='severity-index',
+                      KeyConditionExpression=Key('severity').eq(severity)
+                  )
+                  tickets = response.get('Items', [])
+
+                  while 'LastEvaluatedKey' in response:
+                      response = tickets_table.query(
+                          IndexName='severity-index',
+                          KeyConditionExpression=Key('severity').eq(severity),
+                          ExclusiveStartKey=response['LastEvaluatedKey']
+                      )
+                      tickets.extend(response.get('Items', []))
+
+                  return build_response(200, {'count': len(tickets), 'tickets': tickets})
+
+              else:
+                  response = tickets_table.scan()
+                  tickets = response.get('Items', [])
+
+                  while 'LastEvaluatedKey' in response:
+                      response = tickets_table.scan(
+                          ExclusiveStartKey=response['LastEvaluatedKey']
+                      )
+                      tickets.extend(response.get('Items', []))
+
+                  print(f"[GET_TICKETS] Returning {len(tickets)} tickets")
+                  return build_response(200, {'count': len(tickets), 'tickets': tickets})
+
+
+          def get_ticket_by_id(ticket_id):
+              """Retrieve a single ticket by ticketId."""
+              print(f"[GET_TICKET_BY_ID] Looking up ticketId: {ticket_id}")
+
+              response = tickets_table.query(
+                  KeyConditionExpression=Key('ticketId').eq(ticket_id)
+              )
+              items = response.get('Items', [])
+              print(f"[GET_TICKET_BY_ID] Found {len(items)} items")
+              print(f"[GET_TICKET_BY_ID] Items: {json.dumps(items, default=str)}")
+
+              if not items:
+                  return build_response(404, {'message': 'Ticket not found'})
+
+              return build_response(200, {'ticket': items})
+
+
+          def find_ticket_user_id(ticket_id):
+              """Helper: Look up the userId (sort key) for a given ticketId."""
+              print(f"[FIND_USER_ID] Querying for ticketId: {ticket_id}")
+
+              response = tickets_table.query(
+                  KeyConditionExpression=Key('ticketId').eq(ticket_id)
+              )
+              items = response.get('Items', [])
+
+              print(f"[FIND_USER_ID] Query returned {len(items)} items")
+              print(f"[FIND_USER_ID] Items type: {type(items)}")
+
+              if not items:
+                  print(f"[FIND_USER_ID] No items found for ticketId: {ticket_id}")
+                  return None
+
+              # items is a LIST of dicts - access first element , then the key
+              first_item = items[0]
+              print(f"[FIND_USER_ID] First item type: {type(first_item)}")
+              print(f"[FIND_USER_ID] First item: {json.dumps(first_item, default=str)}")
+
+              user_id = first_item['userId']
+              print(f"[FIND_USER_ID] Resolved userId: {user_id}")
+              return user_id
+
+
+          def update_ticket(event, ticket_id, auth_context):
+              """Update a ticket's status/severity. Requires Admin group membership."""
+              print(f"[UPDATE_TICKET] Starting update for ticketId: {ticket_id}")
+
+              if not auth_context['is_authenticated']:
+                  print(f"[UPDATE_TICKET] REJECTED: Not authenticated")
+                  return build_response(401, {'message': 'Authentication required'})
+
+              if not auth_context['is_admin']:
+                  print(f"[UPDATE_TICKET] REJECTED: Not admin. Groups: {auth_context['groups']}")
+                  return build_response(403, {
+                      'message': 'Forbidden. Only Admin group members can update tickets.'
+                  })
+
+              body = json.loads(event.get('body', '{}'))
+              print(f"[UPDATE_TICKET] Parsed body: {json.dumps(body)}")
+
+              new_status = body.get('status')
+              new_severity = body.get('severity')
+
+              if not new_status and not new_severity:
+                  return build_response(400, {
+                      'message': 'At least one field to update is required (status, severity)'
+                  })
+
+              if new_status and new_status not in VALID_STATUSES:
+                  return build_response(400, {
+                      'message': f'Invalid status. Must be one of: {", ".join(VALID_STATUSES)}'
+                  })
+
+              if new_severity and new_severity not in VALID_SEVERITIES:
+                  return build_response(400, {
+                      'message': f'Invalid severity. Must be one of: {", ".join(VALID_SEVERITIES)}'
+                  })
+
+              # Get the userId (sort key) - from body or by looking up the ticket
+              user_id = body.get('userId')
+              print(f"[UPDATE_TICKET] userId from body: {user_id}")
+
+              if not user_id:
+                  print(f"[UPDATE_TICKET] No userId in body, looking up from DynamoDB...")
+                  user_id = find_ticket_user_id(ticket_id)
+                  if not user_id:
+                      return build_response(404, {'message': 'Ticket not found'})
+
+              print(f"[UPDATE_TICKET] Using userId: {user_id} for key lookup")
+
+              # Build update expression dynamically
+              timestamp = datetime.utcnow().isoformat() + 'Z'
+              update_parts = ['#updatedAt = :updatedAt', '#updatedBy = :updatedBy']
+              expr_names = {
+                  '#updatedAt': 'updatedAt',
+                  '#updatedBy': 'updatedBy'
+              }
+              expr_values = {
+                  ':updatedAt': timestamp,
+                  ':updatedBy': auth_context['email'] or auth_context['user_id']
+              }
+
+              if new_status:
+                  update_parts.append('#status = :status')
+                  expr_names['#status'] = 'status'
+                  expr_values[':status'] = new_status
+
+              if new_severity:
+                  update_parts.append('#severity = :severity')
+                  expr_names['#severity'] = 'severity'
+                  expr_values[':severity'] = new_severity
+
+              update_expression = 'SET ' + ', '.join(update_parts)
+              print(f"[UPDATE_TICKET] Update expression: {update_expression}")
+              print(f"[UPDATE_TICKET] Expression names: {json.dumps(expr_names)}")
+              print(f"[UPDATE_TICKET] Expression values: {json.dumps(expr_values, default=str)}")
+              print(f"[UPDATE_TICKET] Key: ticketId={ticket_id}, userId={user_id}")
+
+              try:
+                  response = tickets_table.update_item(
+                      Key={
+                          'ticketId': ticket_id,
+                          'userId': user_id
+                      },
+                      UpdateExpression=update_expression,
+                      ExpressionAttributeNames=expr_names,
+                      ExpressionAttributeValues=expr_values,
+                      ReturnValues='ALL_NEW',
+                      ConditionExpression='attribute_exists(ticketId)'
+                  )
+                  print(f"[UPDATE_TICKET] Success. Updated attributes: {json.dumps(response.get('Attributes', {}), default=str)}")
+              except Exception as e:
+                  print(f"[UPDATE_TICKET] DynamoDB error: {str(e)}")
+                  print(f"[UPDATE_TICKET] Error type: {type(e).__name__}")
+                  print(f"[UPDATE_TICKET] Traceback: {traceback.format_exc()}")
+                  if 'ConditionalCheckFailedException' in type(e).__name__:
+                      return build_response(404, {'message': 'Ticket not found'})
+                  raise
+
+              return build_response(200, {
+                  'message': 'Ticket updated successfully',
+                  'ticket': response.get('Attributes', {})
+              })
+
+
+          def delete_ticket(event, ticket_id, auth_context):
+              """Delete a ticket. Requires Admin group membership."""
+              print(f"[DELETE_TICKET] Starting delete for ticketId: {ticket_id}")
+
+              if not auth_context['is_authenticated']:
+                  return build_response(401, {'message': 'Authentication required'})
+
+              if not auth_context['is_admin']:
+                  print(f"[DELETE_TICKET] REJECTED: Not admin. Groups: {auth_context['groups']}")
+                  return build_response(403, {
+                      'message': 'Forbidden. Only Admin group members can delete tickets.'
+                  })
+
+              # Get the userId (sort key) - from query params or by looking up the ticket
+              query_params = event.get('queryStringParameters') or {}
+              user_id = query_params.get('userId')
+              print(f"[DELETE_TICKET] userId from query params: {user_id}")
+
+              if not user_id:
+                  print(f"[DELETE_TICKET] No userId in query params, looking up from DynamoDB...")
+                  user_id = find_ticket_user_id(ticket_id)
+                  if not user_id:
+                      return build_response(404, {'message': 'Ticket not found'})
+
+              print(f"[DELETE_TICKET] Using userId: {user_id} for key lookup")
+
+              try:
+                  tickets_table.delete_item(
+                      Key={
+                          'ticketId': ticket_id,
+                          'userId': user_id
+                      },
+                      ConditionExpression='attribute_exists(ticketId)'
+                  )
+                  print(f"[DELETE_TICKET] Successfully deleted ticketId: {ticket_id}")
+              except Exception as e:
+                  print(f"[DELETE_TICKET] DynamoDB error: {str(e)}")
+                  print(f"[DELETE_TICKET] Traceback: {traceback.format_exc()}")
+                  if 'ConditionalCheckFailedException' in type(e).__name__:
+                      return build_response(404, {'message': 'Ticket not found'})
+                  raise
+
+              return build_response(200, {
+                  'message': 'Ticket deleted successfully',
+                  'ticketId': ticket_id
+              })
+
+
+          def build_response(status_code, body):
+              """Build a standardized API Gateway response with CORS headers."""
+              print(f"[RESPONSE] Status: {status_code} | Body: {json.dumps(body, default=str)}")
+              return {
+                  'statusCode': status_code,
+                  'headers': get_cors_headers(),
+                  'body': json.dumps(body, default=str)
+              }
+
+  # ============================================================
+  # API Gateway - REST API
+  # ============================================================
+  TicketSystemApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub TicketSystem-API-${Environment}
+      Description: REST API for the Ticket System with Cognito Auth and full CORS
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # Cognito Authorizer
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: CognitoUserPoolAuthorizer
+      Type: COGNITO_USER_POOLS
+      RestApiId: !Ref TicketSystemApi
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - !GetAtt UserPool.Arn
+
+  # ============================================================
+  # Gateway Responses (CORS for errors returned by API Gateway itself)
+  # ============================================================
+  GatewayResponseDefault4XX:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref TicketSystemApi
+      ResponseType: DEFAULT_4XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+
+  GatewayResponseDefault5XX:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref TicketSystemApi
+      ResponseType: DEFAULT_5XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+
+  GatewayResponseUnauthorized:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref TicketSystemApi
+      ResponseType: UNAUTHORIZED
+      StatusCode: "401"
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+
+  GatewayResponseAccessDenied:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref TicketSystemApi
+      ResponseType: ACCESS_DENIED
+      StatusCode: "403"
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+
+  # ============================================================
+  # /tickets resource
+  # ============================================================
+  TicketsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TicketSystemApi
+      ParentId: !GetAtt TicketSystemApi.RootResourceId
+      PathPart: tickets
+
+  # /tickets/{ticketId} resource
+  TicketByIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TicketSystemApi
+      ParentId: !Ref TicketsResource
+      PathPart: "{ticketId}"
+
+  # ============================================================
+  # Methods on /tickets
+  # ============================================================
+
+  # POST /tickets - Public
+  PostTicketsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TicketSystemApi
+      ResourceId: !Ref TicketsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+        - StatusCode: "201"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+        - StatusCode: "400"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations
+          - FunctionArn: !GetAtt TicketSystemFunction.Arn
+
+  # GET /tickets - Public
+  GetTicketsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TicketSystemApi
+      ResourceId: !Ref TicketsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.querystring.userId: false
+        method.request.querystring.severity: false
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+        - StatusCode: "400"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations
+          - FunctionArn: !GetAtt TicketSystemFunction.Arn
+
+  # OPTIONS /tickets (CORS Preflight)
+  OptionsTicketsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TicketSystemApi
+      ResourceId: !Ref TicketsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Max-Age: true
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Max-Age: "'86400'"
+
+  # ============================================================
+  # Methods on /tickets/{ticketId}
+  # ============================================================
+
+  # GET /tickets/{ticketId} - Public
+  GetTicketByIdMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TicketSystemApi
+      ResourceId: !Ref TicketByIdResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.ticketId: true
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+        - StatusCode: "404"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations
+          - FunctionArn: !GetAtt TicketSystemFunction.Arn
+
+  # PUT /tickets/{ticketId} - Admin only
+  PutTicketMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TicketSystemApi
+      ResourceId: !Ref TicketByIdResource
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      RequestParameters:
+        method.request.path.ticketId: true
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+        - StatusCode: "400"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+        - StatusCode: "403"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+        - StatusCode: "404"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations
+          - FunctionArn: !GetAtt TicketSystemFunction.Arn
+
+  # DELETE /tickets/{ticketId} - Admin only
+  DeleteTicketMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TicketSystemApi
+      ResourceId: !Ref TicketByIdResource
+      HttpMethod: DELETE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      RequestParameters:
+        method.request.path.ticketId: true
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+        - StatusCode: "403"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+        - StatusCode: "404"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations
+          - FunctionArn: !GetAtt TicketSystemFunction.Arn
+
+  # OPTIONS /tickets/{ticketId} (CORS Preflight)
+  OptionsTicketByIdMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TicketSystemApi
+      ResourceId: !Ref TicketByIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Max-Age: true
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Max-Age: "'86400'"
+
+  # ============================================================
+  # API Deployment & Stage
+  # ============================================================
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - PostTicketsMethod
+      - GetTicketsMethod
+      - GetTicketByIdMethod
+      - PutTicketMethod
+      - DeleteTicketMethod
+      - OptionsTicketsMethod
+      - OptionsTicketByIdMethod
+      - GatewayResponseDefault4XX
+      - GatewayResponseDefault5XX
+      - GatewayResponseUnauthorized
+      - GatewayResponseAccessDenied
+    Properties:
+      RestApiId: !Ref TicketSystemApi
+      Description: !Sub "v${DeploymentVersion} - ${Environment}"
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref TicketSystemApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref Environment
+      Description: !Sub ${Environment} stage
+
+  # Lambda Permission for API Gateway
+  LambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt TicketSystemFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TicketSystemApi}/*
+
+# ============================================================
+# Outputs
+# ============================================================
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${TicketSystemApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+
+  PostTicketEndpoint:
+    Description: POST endpoint to create a new ticket (public)
+    Value: !Sub https://${TicketSystemApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/tickets
+
+  GetTicketsEndpoint:
+    Description: GET endpoint to retrieve tickets (supports ?userId= and ?severity=)
+    Value: !Sub https://${TicketSystemApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/tickets
+
+  GetTicketByIdEndpoint:
+    Description: GET endpoint to retrieve a single ticket by ID
+    Value: !Sub https://${TicketSystemApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/tickets/{ticketId}
+
+  UpdateTicketEndpoint:
+    Description: PUT endpoint to update a ticket (Admin auth required)
+    Value: !Sub https://${TicketSystemApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/tickets/{ticketId}
+
+  DeleteTicketEndpoint:
+    Description: DELETE endpoint to delete a ticket (Admin auth required)
+    Value: !Sub https://${TicketSystemApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/tickets/{ticketId}
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+
+  UserPoolDomain:
+    Description: Cognito hosted UI domain
+    Value: !Sub https://ticketsystem-${Environment}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com
+
+  TicketsTableName:
+    Description: DynamoDB Tickets table name
+    Value: !Ref TicketsTable
+
+  UsersTableName:
+    Description: DynamoDB Users table name
+    Value: !Ref UsersTable
+
+  LambdaFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt TicketSystemFunction.Arn
